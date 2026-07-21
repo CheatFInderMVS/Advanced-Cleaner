@@ -1,7 +1,9 @@
 # CONFIGURATION
 Write-Host "=== START OF SCRIPT ===" -ForegroundColor Cyan
+Write-Host "Running script:" -ForegroundColor Cyan
+Write-Host $PSCommandPath -ForegroundColor Yellow
 Write-Host "Initializing TargetNames..." -ForegroundColor Yellow
-$script:TargetNames = [System.Collections.Generic.HashSet[string]]::new(
+$TargetNames = [System.Collections.Generic.HashSet[string]]::new(
     @(
         "app.exe",
         "usermode",
@@ -10,12 +12,16 @@ $script:TargetNames = [System.Collections.Generic.HashSet[string]]::new(
     ),
     [System.StringComparer]::OrdinalIgnoreCase
 )
-Write-Host "TargetNames null? $($script:TargetNames -eq $null)" -ForegroundColor Green
-Write-Host "TargetNames count: $($script:TargetNames.Count)" -ForegroundColor Green
-Write-Host "==========================" -ForegroundColor Cyan
-
-$TargetNames = $script:TargetNames
-$global:TargetNames = $script:TargetNames
+Write-Host "========== INITIALIZATION ==========" -ForegroundColor Cyan
+Write-Host "TargetNames null? " ($null -eq $TargetNames) -ForegroundColor Green
+Write-Host "Target count: " $TargetNames.Count -ForegroundColor Green
+Write-Host "Targets:" -ForegroundColor Green
+$TargetNames | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
+Write-Host "Target contains loader.exe? " ($TargetNames.Contains('loader.exe')) -ForegroundColor Green
+Write-Host "Target contains notepad.exe? " ($TargetNames.Contains('notepad.exe')) -ForegroundColor Green
+Write-Host "====================================" -ForegroundColor Cyan
+Write-Host "Press ENTER to continue..." -ForegroundColor Yellow
+Pause
 
 $DeletedItems = [System.Collections.Generic.List[object]]::new()
 $FailedItems = [System.Collections.Generic.List[object]]::new()
@@ -128,7 +134,7 @@ function Test-MatchesTarget {
         [string]$Text
     )
 
-    if ($null -eq $script:TargetNames) {
+    if ($null -eq $TargetNames) {
         throw "TargetNames has not been initialized."
     }
 
@@ -136,7 +142,7 @@ function Test-MatchesTarget {
         return $false
     }
 
-    return $script:TargetNames.Contains($Text)
+    return $TargetNames.Contains($Text)
 }
 
 function Test-IsProtectedPath {
@@ -274,7 +280,7 @@ function Remove-TargetFileOrFolder {
 }
 
 function Stop-TargetProcesses {
-    foreach ($target in $script:TargetNames) {
+    foreach ($target in $TargetNames) {
         $processName = [System.IO.Path]::GetFileNameWithoutExtension($target)
         $processes = Get-Process -Name $processName -ErrorAction SilentlyContinue
 
@@ -343,7 +349,7 @@ function Test-TargetReference {
         return $false
     }
 
-    return $script:TargetNames.Contains($leaf)
+    return $TargetNames.Contains($leaf)
 }
 
 function Convert-ToRot13 {
@@ -538,7 +544,7 @@ function Remove-RegistryArtifactValues {
 $FilesToDelete = [System.Collections.Generic.List[object]]::new()
 $seenFilePaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-Clear-Host
+# Clear-Host
 Write-Host ""
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "             TARGET CLEANUP TOOL               " -ForegroundColor Cyan
@@ -548,7 +554,7 @@ Write-Host "Version: 1.0" -ForegroundColor Gray
 Write-Host ("Started: {0}" -f (Get-Date)) -ForegroundColor Gray
 Write-Host ""
 Write-Host "Targets being searched:" -ForegroundColor Yellow
-foreach ($target in $script:TargetNames) {
+foreach ($target in $TargetNames) {
     Write-Host ("  [>] {0}" -f $target) -ForegroundColor White
 }
 Write-Host ""
