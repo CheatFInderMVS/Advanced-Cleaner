@@ -1,0 +1,879 @@
+# CONFIGURATION
+$TargetNames = [System.Collections.Generic.HashSet[string]]::new(
+    @(
+        "app.exe",
+        "usermode",
+        "loader.exe",
+        "map.exe"
+    ),
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+
+$DeletedItems = [System.Collections.Generic.List[object]]::new()
+$FailedItems = [System.Collections.Generic.List[object]]::new()
+$RecoveredBytes = 0
+
+$ScanLocations = @{
+    "User Files" = @(
+        "$env:USERPROFILE\Downloads",
+        "$env:USERPROFILE\Documents",
+        "$env:USERPROFILE\Desktop"
+    )
+    "App Data" = @(
+        "$env:APPDATA",
+        "$env:LOCALAPPDATA",
+        "$env:USERPROFILE\AppData\LocalLow"
+    )
+    "System" = @(
+        "$env:TEMP",
+        "C:\Windows\Temp",
+        "C:\ProgramData",
+        "$env:windir\Prefetch"
+    )
+    "Startup" = @(
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
+    )
+}
+
+$JunkLocations = @(
+    "$env:TEMP",
+    "C:\Windows\Temp"
+)
+
+$ProtectedPaths = @(
+    "C:\Windows\System32",
+    "C:\Program Files\WindowsApps"
+)
+
+$ExtensionsToClean = @('.tmp', '.temp', '.cache', '.log')
+$RegRoots = @(
+    "HKCU:\Software",
+    "HKCR:\Software",
+    "HKLM:\Software"
+)
+
+$CleanupSummary = [ordered]@{
+    FilesDeleted = 0
+    FoldersDeleted = 0
+    RegistryItemsDeleted = 0
+    TemporaryFilesDeleted = 0
+    EmptyFoldersRemoved = 0
+    ProcessesStopped = 0
+    StartupEntriesRemoved = 0
+    ScheduledTasksRemoved = 0
+    ServicesRemoved = 0
+    FirewallRulesRemoved = 0
+    ShortcutsRemoved = 0
+    RecentItemsRemoved = 0
+    RegistryArtifactsRemoved = 0
+    UserAssistEntriesRemoved = 0
+}
+
+function Add-DeletedItem {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Kind,
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [datetime]$Timestamp = [datetime]::MinValue,
+        [string]$Reason = $null
+    )
+
+    $script:DeletedItems.Add([pscustomobject]@{
+        Kind = $Kind
+        Name = $Name
+        Path = $Path
+        Timestamp = $Timestamp
+        Reason = $Reason
+    })
+}
+
+function Add-FailedItem {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Kind,
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [string]$Reason = $null
+    )
+
+    $script:FailedItems.Add([pscustomobject]@{
+        Kind = $Kind
+        Name = $Name
+        Path = $Path
+        Timestamp = (Get-Date)
+        Reason = $Reason
+    })
+}
+
+# UTILITY FUNCTIONS
+function Test-MatchesTarget {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    return $script:TargetNames.Contains($Text)
+}
+
+function Test-IsProtectedPath {
+    param([string]$Path)
+
+    foreach ($protected in $script:ProtectedPaths) {
+        if ($Path -and $Path.StartsWith($protected, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-TimeStatus {
+    param(
+        [int]$Current,
+        [int]$Total,
+        [datetime]$StartTime
+    )
+
+    $elapsed = (Get-Date) - $StartTime
+    $elapsedText = $elapsed.ToString('hh\:mm\:ss')
+
+    if ($Current -lt 5 -or $Total -le 0) {
+        return "Elapsed: $elapsedText | ETA: Calculating..."
+    }
+
+    $averageSeconds = $elapsed.TotalSeconds / $Current
+    $remainingSeconds = $averageSeconds * ($Total - $Current)
+    $remaining = [timespan]::FromSeconds($remainingSeconds)
+
+    return "Elapsed: $elapsedText | ETA: $($remaining.ToString('hh\:mm\:ss'))"
+}
+
+function Get-Speed {
+    param(
+        [int]$Current,
+        [datetime]$StartTime
+    )
+
+    if ($Current -le 0) {
+        return "0 items/sec"
+    }
+
+    $seconds = ((Get-Date) - $StartTime).TotalSeconds
+    if ($seconds -eq 0) {
+        return "Calculating..."
+    }
+
+    $speed = $Current / $seconds
+    return "{0:N1} items/sec" -f $speed
+}
+
+function Show-LoadingBar {
+    param(
+        [int]$Current,
+        [int]$Total,
+        [string]$Label = "Cleaning",
+        [datetime]$StartTime,
+        [string]$CurrentItem = "",
+        [string]$CurrentOperation = ""
+    )
+
+    if ($Total -le 0) { return }
+
+    $percent = [int](($Current / $Total) * 100)
+    $time = Get-TimeStatus -Current $Current -Total $Total -StartTime $StartTime
+    $speed = Get-Speed -Current $Current -StartTime $StartTime
+
+    $barLength = 30
+    $filled = [math]::Min([math]::Max([int]($percent / 100 * $barLength), 0), $barLength)
+    $bar = ('█' * $filled) + ('-' * ($barLength - $filled))
+
+    Write-Host ""
+    Write-Host ($Label) -ForegroundColor Cyan
+    Write-Host ("Progress: [{0}] {1}%" -f $bar, $percent) -ForegroundColor Green
+    Write-Host ("Items: {0} / {1}" -f $Current, $Total) -ForegroundColor Yellow
+    Write-Host ("Current: {0}" -f $CurrentItem) -ForegroundColor White
+    Write-Host ("Operation: {0}" -f $CurrentOperation) -ForegroundColor White
+    Write-Host ("Speed: {0}" -f $speed) -ForegroundColor Magenta
+    Write-Host ("Elapsed: {0}" -f $time.Split('|')[0].Trim()) -ForegroundColor Gray
+    Write-Host ("ETA: {0}" -f $time.Split('|')[1].Trim()) -ForegroundColor Gray
+
+    if ($Current -eq $Total) {
+        Write-Progress -Activity $Label -Completed
+    }
+    else {
+        Write-Progress -Activity $Label -Status "$Current of $Total | $percent%" -PercentComplete $percent
+    }
+}
+
+function Remove-TargetFileOrFolder {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileSystemInfo]$Item
+    )
+
+    try {
+        if (Test-IsProtectedPath -Path $Item.FullName) {
+            throw "Protected path"
+        }
+
+        if ($Item.PSIsContainer) {
+            Remove-Item -LiteralPath $Item.FullName -Recurse -Force -ErrorAction Stop
+        }
+        else {
+            Remove-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop
+        }
+
+        if (-not $Item.PSIsContainer -and $Item.PSObject.Properties.Match('Length').Count -gt 0) {
+            $script:RecoveredBytes += $Item.Length
+        }
+
+        Add-DeletedItem -Kind (if ($Item.PSIsContainer) { "FOLDER" } else { "FILE" }) -Name $Item.Name -Path $Item.FullName -Timestamp $Item.LastAccessTime
+
+        return [pscustomobject]@{
+            Success = $true
+            Item = $Item
+            Reason = $null
+        }
+    }
+    catch {
+        Add-FailedItem -Kind (if ($Item.PSIsContainer) { "FOLDER" } else { "FILE" }) -Name $Item.Name -Path $Item.FullName -Reason $_.Exception.Message
+
+        return [pscustomobject]@{
+            Success = $false
+            Item = $Item
+            Reason = $_.Exception.Message
+        }
+    }
+}
+
+function Stop-TargetProcesses {
+    foreach ($target in $script:TargetNames) {
+        $processName = [System.IO.Path]::GetFileNameWithoutExtension($target)
+        $processes = Get-Process -Name $processName -ErrorAction SilentlyContinue
+
+        if ($processes) {
+            Write-Host "Stopping process: $processName" -ForegroundColor Yellow
+            Stop-Process -Name $processName -Force -ErrorAction SilentlyContinue
+            $script:CleanupSummary.ProcessesStopped += $processes.Count
+        }
+    }
+}
+
+function Remove-EmptyDirectories {
+    param([string[]]$Paths)
+
+    $removed = 0
+
+    foreach ($path in $Paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+
+        $dirs = Get-ChildItem -LiteralPath $path -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending
+
+        foreach ($dir in $dirs) {
+            if (-not (Test-IsProtectedPath -Path $dir.FullName)) {
+                $childItems = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)
+                if ($childItems.Count -eq 0) {
+                    Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue
+                    $removed++
+                }
+            }
+        }
+    }
+
+    return $removed
+}
+
+function Get-LeafName {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    $trimmed = $Text.Trim().Trim('"')
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return $null
+    }
+
+    try {
+        $leaf = [System.IO.Path]::GetFileName($trimmed)
+        if ([string]::IsNullOrWhiteSpace($leaf)) {
+            return $trimmed
+        }
+        return $leaf
+    }
+    catch {
+        return $trimmed
+    }
+}
+
+function Test-TargetReference {
+    param([string]$Text)
+
+    $leaf = Get-LeafName -Text $Text
+    if ([string]::IsNullOrWhiteSpace($leaf)) {
+        return $false
+    }
+
+    return $script:TargetNames.Contains($leaf)
+}
+
+function Convert-ToRot13 {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $Text
+    }
+
+    $chars = $Text.ToCharArray()
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $char = $chars[$i]
+        if ($char -ge 'a' -and $char -le 'z') {
+            $chars[$i] = [char]((([int]$char - [int][char]'a' + 13) % 26) + [int][char]'a')
+        }
+        elseif ($char -ge 'A' -and $char -le 'Z') {
+            $chars[$i] = [char]((([int]$char - [int][char]'A' + 13) % 26) + [int][char]'A')
+        }
+    }
+
+    return -join $chars
+}
+
+function Get-ShortcutTarget {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($Path)
+        return $shortcut.TargetPath
+    }
+    catch {
+        return $null
+    }
+}
+
+function Remove-ShortcutArtifacts {
+    param([string[]]$Paths)
+
+    $removed = 0
+
+    foreach ($path in $Paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+
+        $shortcuts = Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in @('.lnk', '.url') }
+
+        foreach ($shortcut in $shortcuts) {
+            try {
+                $target = Get-ShortcutTarget -Path $shortcut.FullName
+                if (Test-TargetReference -Text $target) {
+                    Remove-Item -LiteralPath $shortcut.FullName -Force -ErrorAction Stop
+                    Add-DeletedItem -Kind "SHORTCUT" -Name $shortcut.Name -Path $shortcut.FullName -Timestamp $shortcut.LastWriteTime
+                    $script:CleanupSummary.ShortcutsRemoved++
+                    $removed++
+                }
+            }
+            catch {
+                Add-FailedItem -Kind "SHORTCUT" -Name $shortcut.Name -Path $shortcut.FullName -Reason $_.Exception.Message
+            }
+        }
+    }
+
+    return $removed
+}
+
+function Remove-FirewallArtifacts {
+    $removed = 0
+
+    if (-not (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        return $removed
+    }
+
+    foreach ($rule in Get-NetFirewallRule -ErrorAction SilentlyContinue) {
+        try {
+            $filters = @(Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue)
+            foreach ($filter in $filters) {
+                if (Test-TargetReference -Text $filter.Program) {
+                    Remove-NetFirewallRule -Name $rule.Name -ErrorAction Stop
+                    Add-DeletedItem -Kind "FIREWALL" -Name $rule.DisplayName -Path $rule.Name -Timestamp (Get-Date)
+                    $script:CleanupSummary.FirewallRulesRemoved++
+                    $removed++
+                    break
+                }
+            }
+        }
+        catch {
+            Add-FailedItem -Kind "FIREWALL" -Name $rule.DisplayName -Path $rule.Name -Reason $_.Exception.Message
+        }
+    }
+
+    return $removed
+}
+
+function Remove-RegistryArtifactValues {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [switch]$InspectData,
+        [switch]$InspectName,
+        [switch]$DecodeName
+    )
+
+    $removed = 0
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $removed
+    }
+
+    $keys = @(Get-ChildItem -LiteralPath $Path -Recurse -ErrorAction SilentlyContinue)
+    foreach ($key in $keys) {
+        foreach ($valueName in @($key.GetValueNames())) {
+            $valueData = $null
+            try {
+                $valueData = $key.GetValue($valueName)
+            }
+            catch {
+            }
+
+            $match = $false
+            $candidateText = $null
+
+            if ($InspectName) {
+                $candidateText = $valueName
+                if ($DecodeName) {
+                    $candidateText = Convert-ToRot13 -Text $candidateText
+                }
+                if (Test-TargetReference -Text $candidateText) {
+                    $match = $true
+                }
+            }
+
+            if (-not $match -and $InspectData -and $null -ne $valueData) {
+                $candidateText = [string]$valueData
+                if (Test-TargetReference -Text $candidateText) {
+                    $match = $true
+                }
+            }
+
+            if ($match) {
+                try {
+                    Remove-ItemProperty -Path $key.PSPath -Name $valueName -ErrorAction Stop
+                    Add-DeletedItem -Kind "REGISTRY" -Name $valueName -Path $key.PSPath -Timestamp ([datetime]::MinValue)
+                    $script:CleanupSummary.RegistryArtifactsRemoved++
+                    if ($Path -match 'RecentDocs|RunMRU') {
+                        $script:CleanupSummary.RecentItemsRemoved++
+                    }
+                    elseif ($Path -match 'UserAssist') {
+                        $script:CleanupSummary.UserAssistEntriesRemoved++
+                    }
+                    $removed++
+                }
+                catch {
+                    Add-FailedItem -Kind "REGISTRY" -Name $valueName -Path $key.PSPath -Reason $_.Exception.Message
+                }
+            }
+        }
+    }
+
+    return $removed
+}
+
+# FILE SCANNER
+$FilesToDelete = [System.Collections.Generic.List[object]]::new()
+
+Clear-Host
+Write-Host ""
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host "             TARGET CLEANUP TOOL               " -ForegroundColor Cyan
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Version: 1.0" -ForegroundColor Gray
+Write-Host ("Started: {0}" -f (Get-Date)) -ForegroundColor Gray
+Write-Host ""
+Write-Host "Targets being searched:" -ForegroundColor Yellow
+foreach ($target in $script:TargetNames) {
+    Write-Host ("  [>] {0}" -f $target) -ForegroundColor White
+}
+Write-Host ""
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host ""
+
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "Administrator privileges are required for full cleanup." -ForegroundColor Red
+    Write-Host "Run this script as Administrator and try again." -ForegroundColor Red
+    exit
+}
+
+Write-Host "[1/6] CHECKING ACTIVE PROCESSES" -ForegroundColor Cyan
+Stop-TargetProcesses
+Write-Host ""
+
+Write-Host "[2/6] SCANNING FILE SYSTEM" -ForegroundColor Cyan
+Write-Host "Scanning file system..." -ForegroundColor White
+Write-Host ""
+$scanIndex = 0
+$scanCategoryCount = $ScanLocations.Count
+foreach ($category in $ScanLocations.Keys) {
+    Write-Host ("[+] Scanning {0}..." -f $category) -ForegroundColor DarkCyan
+    foreach ($location in $ScanLocations[$category]) {
+        if (Test-Path -LiteralPath $location) {
+            $items = Get-ChildItem -LiteralPath $location -Force -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { Test-MatchesTarget $_.Name }
+
+            foreach ($item in $items) {
+                $FilesToDelete.Add($item)
+            }
+        }
+    }
+
+    $scanIndex++
+    $scanPercent = [int](($scanIndex / $scanCategoryCount) * 100)
+    Write-Progress -Activity "Scanning files" -Status "Category $scanIndex of $scanCategoryCount" -PercentComplete $scanPercent
+}
+Write-Progress -Activity "Scanning files" -Completed
+
+$FilesToDelete = $FilesToDelete |
+    Sort-Object @{ Expression = { ($_.FullName.Split("\\").Count) }; Descending = $true }, FullName -Unique
+
+$fileCount = ($FilesToDelete | Where-Object { -not $_.PSIsContainer }).Count
+$folderCount = ($FilesToDelete | Where-Object { $_.PSIsContainer }).Count
+
+Write-Host ""
+Write-Host "Scan Results" -ForegroundColor Cyan
+Write-Host ("Files: {0}" -f $fileCount) -ForegroundColor Yellow
+Write-Host ("Folders: {0}" -f $folderCount) -ForegroundColor Yellow
+Write-Host ("Total: {0}" -f $FilesToDelete.Count) -ForegroundColor Yellow
+Write-Host ""
+
+if ($FilesToDelete.Count -eq 0) {
+    Write-Host "================================================" -ForegroundColor Cyan
+    Write-Host "              SYSTEM CLEAN" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "No matching targets were found." -ForegroundColor Yellow
+    Write-Host "No changes were made." -ForegroundColor Yellow
+    Write-Host "================================================" -ForegroundColor Cyan
+    exit
+}
+
+Write-Host "FILES FOUND" -ForegroundColor Yellow
+Write-Host "--------------------------------" -ForegroundColor DarkGray
+foreach ($item in $FilesToDelete) {
+    Write-Host ("FILE: {0}" -f $item.FullName) -ForegroundColor White
+}
+Write-Host ""
+Write-Host ("Total files/folders: {0}" -f $FilesToDelete.Count) -ForegroundColor White
+Write-Host ""
+$response = Read-Host "Continue? Press ENTER to continue or C to cancel"
+if ($response -eq "C") {
+    Write-Host "Cancelled." -ForegroundColor Yellow
+    exit
+}
+
+Write-Host ""
+Write-Host "[3/6] REMOVING FILES" -ForegroundColor Cyan
+Write-Host "Removing files and folders..." -ForegroundColor White
+Write-Host ""
+$FileStartTime = Get-Date
+for ($i = 0; $i -lt $FilesToDelete.Count; $i++) {
+    $item = $FilesToDelete[$i]
+    if (Test-Path -LiteralPath $item.FullName) {
+        $result = Remove-TargetFileOrFolder -Item $item
+        if ($result.Success) {
+            if ($item.PSIsContainer) {
+                $script:CleanupSummary.FoldersDeleted++
+            }
+            else {
+                $script:CleanupSummary.FilesDeleted++
+            }
+        }
+    }
+
+    Show-LoadingBar -Current ($i + 1) -Total $FilesToDelete.Count -Label "Files" -StartTime $FileStartTime -CurrentItem $item.Name -CurrentOperation "Removing"
+}
+
+$removedDirectories = Remove-EmptyDirectories -Paths @($ScanLocations.Values)
+$script:CleanupSummary.EmptyFoldersRemoved = $removedDirectories
+Write-Host ""
+Write-Host ("Empty folders removed: {0}" -f $removedDirectories) -ForegroundColor Green
+Write-Host ""
+
+Write-Host "[4/6] CLEANING TEMPORARY FILES" -ForegroundColor Cyan
+foreach ($location in $JunkLocations) {
+    if (-not (Test-Path -LiteralPath $location)) { continue }
+
+    $items = Get-ChildItem -LiteralPath $location -Force -Recurse -ErrorAction SilentlyContinue
+    foreach ($item in $items) {
+        $isTemp = $false
+        if ($item.LastWriteTime -lt (Get-Date).AddDays(-7)) {
+            $isTemp = $true
+        }
+        else {
+            $ext = [System.IO.Path]::GetExtension($item.Name)
+            if ($ExtensionsToClean -contains $ext) {
+                $isTemp = $true
+            }
+        }
+
+        if ($isTemp -and (Test-Path -LiteralPath $item.FullName)) {
+            $result = Remove-TargetFileOrFolder -Item $item
+            if ($result.Success) {
+                $script:CleanupSummary.TemporaryFilesDeleted++
+            }
+        }
+    }
+}
+Write-Host ""
+
+Write-Host "[5/6] SCANNING REGISTRY" -ForegroundColor Cyan
+$RegistryItems = [System.Collections.Generic.List[object]]::new()
+foreach ($Root in $RegRoots) {
+    if (Test-Path -LiteralPath $Root) {
+        $keys = Get-ChildItem -Path $Root -Recurse -ErrorAction SilentlyContinue
+        foreach ($key in $keys) {
+            $keyName = $key.PSChildName
+            if (Test-MatchesTarget $keyName) {
+                $RegistryItems.Add([pscustomobject]@{ Type = "KEY"; Name = $keyName; Path = $key.PSPath })
+            }
+
+            try {
+                foreach ($valueName in @($key.GetValueNames())) {
+                    $matchesValueName = Test-MatchesTarget -Text $valueName
+                    $matchesValueData = $false
+
+                    $valueData = $null
+                    try {
+                        $valueData = $key.GetValue($valueName)
+                    }
+                    catch {
+                    }
+
+                    if ($valueData -is [string]) {
+                        $trimmedData = $valueData.Trim('"')
+                        $dataName = [System.IO.Path]::GetFileName($trimmedData)
+                        if (-not [string]::IsNullOrWhiteSpace($dataName)) {
+                            $matchesValueData = Test-MatchesTarget -Text $dataName
+                        }
+                    }
+
+                    if ($matchesValueName -or $matchesValueData) {
+                        $RegistryItems.Add([pscustomobject]@{ Type = "VALUE"; Name = $valueName; Path = $key.PSPath; ValueData = $valueData })
+                    }
+                }
+            }
+            catch {
+            }
+        }
+    }
+}
+
+$RegistryItems = $RegistryItems | Sort-Object Type, Path, Name -Unique
+
+$registryKeyCount = ($RegistryItems | Where-Object { $_.Type -eq "KEY" }).Count
+$registryValueCount = ($RegistryItems | Where-Object { $_.Type -eq "VALUE" }).Count
+
+Write-Host ""
+Write-Host "Scan Results" -ForegroundColor Cyan
+Write-Host ("Registry Keys: {0}" -f $registryKeyCount) -ForegroundColor Yellow
+Write-Host ("Registry Values: {0}" -f $registryValueCount) -ForegroundColor Yellow
+Write-Host ("Total: {0}" -f $RegistryItems.Count) -ForegroundColor Yellow
+Write-Host ""
+
+if ($RegistryItems.Count -gt 0) {
+    Write-Host "Registry items that WILL be deleted:" -ForegroundColor Yellow
+    Write-Host ""
+    $RegistryItems | Select-Object Type, Name, Path | Format-Table -AutoSize | Out-Host
+    Write-Host ""
+    $response = Read-Host "Continue? Press ENTER to continue or C to cancel"
+    if ($response -eq "C") {
+        Write-Host "Cancelled." -ForegroundColor Yellow
+        exit
+    }
+
+    if (Get-Command Checkpoint-Computer -ErrorAction SilentlyContinue) {
+        Write-Host "Creating system restore point..." -ForegroundColor Yellow
+        Checkpoint-Computer -Description "Before Cleanup" -RestorePointType MODIFY_SETTINGS | Out-Null
+    }
+
+    $RegistryStartTime = Get-Date
+    Write-Host ""
+    Write-Host "[6/6] REMOVING REGISTRY ITEMS" -ForegroundColor Cyan
+    Write-Host "Removing registry items..." -ForegroundColor White
+    Write-Host ""
+    for ($i = 0; $i -lt $RegistryItems.Count; $i++) {
+        $item = $RegistryItems[$i]
+        try {
+            if ($item.Type -eq "KEY") {
+                $confirmName = Split-Path $item.Path -Leaf
+                if (-not (Test-MatchesTarget $confirmName)) {
+                    throw "Registry key name verification failed"
+                }
+                Remove-Item -LiteralPath $item.Path -Recurse -Force -ErrorAction Stop
+            }
+            else {
+                if (-not (Test-MatchesTarget $item.Name)) {
+                    throw "Registry value verification failed"
+                }
+                Remove-ItemProperty -Path $item.Path -Name $item.Name -ErrorAction Stop
+            }
+
+            Add-DeletedItem -Kind "REGISTRY" -Name $item.Name -Path $item.Path -Timestamp ([datetime]::MinValue)
+            $script:CleanupSummary.RegistryItemsDeleted++
+        }
+        catch {
+            Add-FailedItem -Kind $item.Type -Name $item.Name -Path $item.Path -Reason $_.Exception.Message
+        }
+
+        Show-LoadingBar -Current ($i + 1) -Total $RegistryItems.Count -Label "Registry" -StartTime $RegistryStartTime -CurrentItem $item.Name -CurrentOperation "Removing"
+    }
+    Write-Host ""
+    Write-Host "Registry cleanup complete." -ForegroundColor Green
+}
+else {
+    Write-Host "No matching registry items found." -ForegroundColor Yellow
+}
+
+Write-Host ""
+Write-Host "[7/8] CLEANING STARTUP, TASKS, AND SERVICES" -ForegroundColor Cyan
+$startupPaths = @(
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+)
+foreach ($path in $startupPaths) {
+    if (Test-Path -LiteralPath $path) {
+        $props = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+        foreach ($propName in $props.PSObject.Properties.Name) {
+            if ($propName -in @('PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider')) { continue }
+            if (Test-MatchesTarget $propName) {
+                Remove-ItemProperty -Path $path -Name $propName -ErrorAction SilentlyContinue
+                $script:CleanupSummary.StartupEntriesRemoved++
+            }
+        }
+    }
+}
+
+if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+    $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue
+    foreach ($task in $tasks) {
+        foreach ($action in @($task.Actions)) {
+            $leaf = [System.IO.Path]::GetFileName($action.Execute)
+            if (Test-MatchesTarget $leaf) {
+                Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                $script:CleanupSummary.ScheduledTasksRemoved++
+                break
+            }
+        }
+    }
+}
+
+$services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue
+foreach ($service in $services) {
+    $binaryName = [System.IO.Path]::GetFileName($service.PathName)
+    if (Test-MatchesTarget $binaryName) {
+        Stop-Service -Name $service.Name -ErrorAction SilentlyContinue
+        Invoke-CimMethod -ClassName Win32_Service -MethodName Delete -Arguments @{ Name = $service.Name } -ErrorAction SilentlyContinue | Out-Null
+        $script:CleanupSummary.ServicesRemoved++
+    }
+}
+
+Write-Host ""
+Write-Host "[8/8] CLEANING WINDOWS ARTIFACTS" -ForegroundColor Cyan
+Write-Host "Removing shortcut, firewall, and registry artifact references..." -ForegroundColor White
+Write-Host ""
+
+Remove-ShortcutArtifacts -Paths @(
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+    "$env:USERPROFILE\Desktop",
+    "$env:APPDATA\Microsoft\Windows\Recent"
+) | Out-Null
+
+Remove-FirewallArtifacts | Out-Null
+
+$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs" -InspectData
+$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU" -InspectData
+$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\MuiCache" -InspectName -InspectData
+$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store" -InspectData
+$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" -InspectData
+$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" -InspectData
+$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist" -InspectName -InspectData -DecodeName
+
+# REPORTING
+$RecoveredMB = [math]::Round($RecoveredBytes / 1MB, 2)
+$RecoveredGB = [math]::Round($RecoveredBytes / 1GB, 2)
+$filesDeleted = ($DeletedItems | Where-Object { $_.Kind -eq "FILE" }).Count
+$foldersDeleted = ($DeletedItems | Where-Object { $_.Kind -eq "FOLDER" }).Count
+$registryDeleted = ($DeletedItems | Where-Object { $_.Kind -eq "REGISTRY" }).Count
+$totalRemoved = $filesDeleted + $foldersDeleted + $registryDeleted
+
+if ($DeletedItems.Count -eq 0 -and $FailedItems.Count -eq 0) {
+    Write-Host ""
+    Write-Host "================================================" -ForegroundColor Cyan
+    Write-Host "              SYSTEM CLEAN" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "No matching targets were found." -ForegroundColor Yellow
+    Write-Host "No changes were made." -ForegroundColor Yellow
+    Write-Host "================================================" -ForegroundColor Cyan
+    exit
+}
+
+Write-Host ""
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host "                 CLEANUP COMPLETE" -ForegroundColor Cyan
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Results:" -ForegroundColor Yellow
+Write-Host ("Files deleted: {0}" -f $filesDeleted) -ForegroundColor White
+Write-Host ("Folders deleted: {0}" -f $foldersDeleted) -ForegroundColor White
+Write-Host ("Registry items deleted: {0}" -f $registryDeleted) -ForegroundColor White
+Write-Host ("Temporary files deleted: {0}" -f $CleanupSummary.TemporaryFilesDeleted) -ForegroundColor White
+Write-Host ("Empty folders removed: {0}" -f $CleanupSummary.EmptyFoldersRemoved) -ForegroundColor White
+Write-Host ("Startup entries removed: {0}" -f $CleanupSummary.StartupEntriesRemoved) -ForegroundColor White
+Write-Host ("Scheduled tasks removed: {0}" -f $CleanupSummary.ScheduledTasksRemoved) -ForegroundColor White
+Write-Host ("Services removed: {0}" -f $CleanupSummary.ServicesRemoved) -ForegroundColor White
+Write-Host ("Firewall rules removed: {0}" -f $CleanupSummary.FirewallRulesRemoved) -ForegroundColor White
+Write-Host ("Shortcuts removed: {0}" -f $CleanupSummary.ShortcutsRemoved) -ForegroundColor White
+Write-Host ("Registry artifacts removed: {0}" -f $CleanupSummary.RegistryArtifactsRemoved) -ForegroundColor White
+Write-Host ("Total removed: {0}" -f $totalRemoved) -ForegroundColor White
+Write-Host ("Space recovered: {0} GB ({1} MB)" -f $RecoveredGB, $RecoveredMB) -ForegroundColor Green
+Write-Host ("Finished: {0}" -f (Get-Date)) -ForegroundColor Gray
+Write-Host ""
+
+if ($FailedItems.Count -gt 0) {
+    Write-Host "Failed removals:" -ForegroundColor Red
+    foreach ($failure in $FailedItems) {
+        Write-Host ("- {0}" -f $failure.Name) -ForegroundColor Red
+        Write-Host ("  Reason: {0}" -f $failure.Reason) -ForegroundColor DarkRed
+    }
+    Write-Host ""
+}
+
+Write-Host "Deleted items preview:" -ForegroundColor Cyan
+foreach ($entry in $DeletedItems) {
+    Write-Host ""
+    Write-Host ("- TYPE = {0}" -f $entry.Kind) -ForegroundColor White
+    Write-Host ("- NAME = {0}" -f $entry.Name) -ForegroundColor White
+    Write-Host ("- PATH = {0}" -f $entry.Path) -ForegroundColor White
+
+    $timestampValue = if ($entry.PSObject.Properties.Match('Timestamp').Count -gt 0) { $entry.Timestamp } else { $entry.LastAccessTime }
+    Write-Host ("- TIMESTAMP = {0}" -f $timestampValue) -ForegroundColor White
+
+    if ($entry.PSObject.Properties.Match('Reason').Count -gt 0 -and $null -ne $entry.Reason) {
+        Write-Host ("- REASON = {0}" -f $entry.Reason) -ForegroundColor DarkGray
+    }
+}
+Write-Host ""
+Write-Host "================================================" -ForegroundColor Cyan
