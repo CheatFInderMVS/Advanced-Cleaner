@@ -1,4 +1,6 @@
 # CONFIGURATION
+Write-Host "=== START OF SCRIPT ===" -ForegroundColor Cyan
+Write-Host "Initializing TargetNames..." -ForegroundColor Yellow
 $script:TargetNames = [System.Collections.Generic.HashSet[string]]::new(
     @(
         "app.exe",
@@ -8,6 +10,9 @@ $script:TargetNames = [System.Collections.Generic.HashSet[string]]::new(
     ),
     [System.StringComparer]::OrdinalIgnoreCase
 )
+Write-Host "TargetNames null? $($script:TargetNames -eq $null)" -ForegroundColor Green
+Write-Host "TargetNames count: $($script:TargetNames.Count)" -ForegroundColor Green
+Write-Host "==========================" -ForegroundColor Cyan
 
 $TargetNames = $script:TargetNames
 $global:TargetNames = $script:TargetNames
