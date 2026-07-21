@@ -1,5 +1,5 @@
 # CONFIGURATION
-$TargetNames = [System.Collections.Generic.HashSet[string]]::new(
+$script:TargetNames = [System.Collections.Generic.HashSet[string]]::new(
     @(
         "app.exe",
         "usermode",
@@ -8,6 +8,9 @@ $TargetNames = [System.Collections.Generic.HashSet[string]]::new(
     ),
     [System.StringComparer]::OrdinalIgnoreCase
 )
+
+$TargetNames = $script:TargetNames
+$global:TargetNames = $script:TargetNames
 
 $DeletedItems = [System.Collections.Generic.List[object]]::new()
 $FailedItems = [System.Collections.Generic.List[object]]::new()
@@ -42,7 +45,10 @@ $JunkLocations = @(
 
 $ProtectedPaths = @(
     "C:\Windows\System32",
-    "C:\Program Files\WindowsApps"
+    "C:\Program Files\WindowsApps",
+    "C:\Program Files",
+    "C:\Program Files (x86)",
+    "C:\ProgramData\Microsoft"
 )
 
 $ExtensionsToClean = @('.tmp', '.temp', '.cache', '.log')
@@ -116,6 +122,10 @@ function Test-MatchesTarget {
         [Parameter(Mandatory)]
         [string]$Text
     )
+
+    if ($null -eq $script:TargetNames) {
+        throw "TargetNames has not been initialized."
+    }
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
         return $false
@@ -222,6 +232,10 @@ function Remove-TargetFileOrFolder {
     try {
         if (Test-IsProtectedPath -Path $Item.FullName) {
             throw "Protected path"
+        }
+
+        if (-not (Test-MatchesTarget $Item.Name)) {
+            throw "Deletion blocked: unexpected filename"
         }
 
         if ($Item.PSIsContainer) {
@@ -647,30 +661,7 @@ Write-Host ("Empty folders removed: {0}" -f $removedDirectories) -ForegroundColo
 Write-Host ""
 
 Write-Host "[4/6] CLEANING TEMPORARY FILES" -ForegroundColor Cyan
-foreach ($location in $JunkLocations) {
-    if (-not (Test-Path -LiteralPath $location)) { continue }
-
-    $items = Get-ChildItem -LiteralPath $location -Force -Recurse -ErrorAction SilentlyContinue
-    foreach ($item in $items) {
-        $isTemp = $false
-        if ($item.LastWriteTime -lt (Get-Date).AddDays(-7)) {
-            $isTemp = $true
-        }
-        else {
-            $ext = [System.IO.Path]::GetExtension($item.Name)
-            if ($ExtensionsToClean -contains $ext) {
-                $isTemp = $true
-            }
-        }
-
-        if ($isTemp -and (Test-Path -LiteralPath $item.FullName)) {
-            $result = Remove-TargetFileOrFolder -Item $item
-            if ($result.Success) {
-                $script:CleanupSummary.TemporaryFilesDeleted++
-            }
-        }
-    }
-}
+Write-Host "Temporary cleanup is disabled for this run because it is not target-specific." -ForegroundColor Yellow
 Write-Host ""
 
 Write-Host "[5/6] SCANNING REGISTRY" -ForegroundColor Cyan
