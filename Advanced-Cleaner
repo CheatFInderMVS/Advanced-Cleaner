@@ -3,15 +3,13 @@ Write-Host "=== START OF SCRIPT ===" -ForegroundColor Cyan
 Write-Host "Running script:" -ForegroundColor Cyan
 Write-Host $PSCommandPath -ForegroundColor Yellow
 Write-Host "Initializing TargetNames..." -ForegroundColor Yellow
-$TargetNames = [System.Collections.Generic.HashSet[string]]::new(
-    @(
-        "app.exe",
-        "usermode",
-        "loader.exe",
-        "map.exe"
-    ),
-    [System.StringComparer]::OrdinalIgnoreCase
-)
+$TargetNames = New-Object 'System.Collections.Generic.HashSet[string]'
+
+$TargetNames.Add('app.exe') | Out-Null
+$TargetNames.Add('usermode') | Out-Null
+$TargetNames.Add('loader.exe') | Out-Null
+$TargetNames.Add('map.exe') | Out-Null
+
 Write-Host "========== INITIALIZATION ==========" -ForegroundColor Cyan
 Write-Host "TargetNames null? " ($null -eq $TargetNames) -ForegroundColor Green
 Write-Host "Target count: " $TargetNames.Count -ForegroundColor Green
@@ -130,19 +128,52 @@ function Add-FailedItem {
 # UTILITY FUNCTIONS
 function Test-MatchesTarget {
     param(
+        [Alias('Text')]
         [Parameter(Mandatory)]
-        [string]$Text
+        [string]$Name
     )
 
     if ($null -eq $TargetNames) {
         throw "TargetNames has not been initialized."
     }
 
-    if ([string]::IsNullOrWhiteSpace($Text)) {
+    if ([string]::IsNullOrWhiteSpace($Name)) {
         return $false
     }
 
-    return $TargetNames.Contains($Text)
+    $leaf = [System.IO.Path]::GetFileName($Name)
+    return $TargetNames.Contains($leaf.ToLowerInvariant())
+}
+
+function Test-TargetReference {
+    param(
+        [Alias('Text')]
+        [Parameter(Mandatory)]
+        [string]$Text
+    )
+
+    $leaf = Get-LeafName -Text $Text
+    if ([string]::IsNullOrWhiteSpace($leaf)) {
+        return $false
+    }
+
+    return $TargetNames.Contains($leaf.ToLowerInvariant())
+}
+
+function Validate-DeletionCandidates {
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.Generic.List[object]]$Candidates
+    )
+
+    foreach ($candidate in $Candidates) {
+        $leaf = [System.IO.Path]::GetFileName($candidate.FullName).ToLowerInvariant()
+        if (-not $TargetNames.Contains($leaf)) {
+            throw "Unexpected deletion candidate: $($candidate.FullName)`nOnly exact target names may be removed."
+        }
+    }
+
+    return $true
 }
 
 function Test-IsProtectedPath {
@@ -249,6 +280,11 @@ function Remove-TargetFileOrFolder {
             throw "Deletion blocked: unexpected filename"
         }
 
+        $itemName = [System.IO.Path]::GetFileName($Item.FullName).ToLowerInvariant()
+        if (-not $TargetNames.Contains($itemName)) {
+            throw "Safety stop. Refusing to delete $($Item.FullName) because its exact name is not in the target list."
+        }
+
         if ($Item.PSIsContainer) {
             Remove-Item -LiteralPath $Item.FullName -Recurse -Force -ErrorAction Stop
         }
@@ -260,7 +296,14 @@ function Remove-TargetFileOrFolder {
             $script:RecoveredBytes += $Item.Length
         }
 
-        Add-DeletedItem -Kind (if ($Item.PSIsContainer) { "FOLDER" } else { "FILE" }) -Name $Item.Name -Path $Item.FullName -Timestamp $Item.LastAccessTime
+        if ($Item.PSIsContainer) {
+            $itemKind = "FOLDER"
+        }
+        else {
+            $itemKind = "FILE"
+        }
+
+        Add-DeletedItem -Kind $itemKind -Name $Item.Name -Path $Item.FullName -Timestamp $Item.LastAccessTime
 
         return [pscustomobject]@{
             Success = $true
@@ -269,7 +312,14 @@ function Remove-TargetFileOrFolder {
         }
     }
     catch {
-        Add-FailedItem -Kind (if ($Item.PSIsContainer) { "FOLDER" } else { "FILE" }) -Name $Item.Name -Path $Item.FullName -Reason $_.Exception.Message
+        if ($Item.PSIsContainer) {
+            $itemKind = "FOLDER"
+        }
+        else {
+            $itemKind = "FILE"
+        }
+
+        Add-FailedItem -Kind $itemKind -Name $Item.Name -Path $Item.FullName -Reason $_.Exception.Message
 
         return [pscustomobject]@{
             Success = $false
@@ -290,31 +340,6 @@ function Stop-TargetProcesses {
             $script:CleanupSummary.ProcessesStopped += $processes.Count
         }
     }
-}
-
-function Remove-EmptyDirectories {
-    param([string[]]$Paths)
-
-    $removed = 0
-
-    foreach ($path in $Paths) {
-        if (-not (Test-Path -LiteralPath $path)) { continue }
-
-        $dirs = Get-ChildItem -LiteralPath $path -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending
-
-        foreach ($dir in $dirs) {
-            if (-not (Test-IsProtectedPath -Path $dir.FullName)) {
-                $childItems = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)
-                if ($childItems.Count -eq 0) {
-                    Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue
-                    $removed++
-                }
-            }
-        }
-    }
-
-    return $removed
 }
 
 function Get-LeafName {
@@ -339,17 +364,6 @@ function Get-LeafName {
     catch {
         return $trimmed
     }
-}
-
-function Test-TargetReference {
-    param([string]$Text)
-
-    $leaf = Get-LeafName -Text $Text
-    if ([string]::IsNullOrWhiteSpace($leaf)) {
-        return $false
-    }
-
-    return $TargetNames.Contains($leaf)
 }
 
 function Convert-ToRot13 {
@@ -602,6 +616,8 @@ Write-Progress -Activity "Scanning files" -Completed
 $FilesToDelete = $FilesToDelete |
     Sort-Object @{ Expression = { ($_.FullName.Split("\\").Count) }; Descending = $true }, FullName -Unique
 
+Validate-DeletionCandidates -Candidates $FilesToDelete
+
 $fileCount = ($FilesToDelete | Where-Object { -not $_.PSIsContainer }).Count
 $folderCount = ($FilesToDelete | Where-Object { $_.PSIsContainer }).Count
 
@@ -625,13 +641,14 @@ if ($FilesToDelete.Count -eq 0) {
 Write-Host "FILES FOUND" -ForegroundColor Yellow
 Write-Host "--------------------------------" -ForegroundColor DarkGray
 foreach ($item in $FilesToDelete) {
-    Write-Host ("FILE: {0}" -f $item.FullName) -ForegroundColor White
+    $kind = if ($item.PSIsContainer) { 'FOLDER' } else { 'FILE' }
+    Write-Host ("{0}: {1}" -f $kind, $item.FullName) -ForegroundColor White
 }
 Write-Host ""
 Write-Host ("Total files/folders: {0}" -f $FilesToDelete.Count) -ForegroundColor White
 Write-Host ""
-$response = Read-Host "Continue? Press ENTER to continue or C to cancel"
-if ($response -eq "C") {
+$response = Read-Host "Delete these {0} items? [Y/N]" -f $FilesToDelete.Count
+if ($response.ToUpperInvariant() -ne 'Y') {
     Write-Host "Cancelled." -ForegroundColor Yellow
     exit
 }
@@ -657,19 +674,6 @@ for ($i = 0; $i -lt $FilesToDelete.Count; $i++) {
 
     Show-LoadingBar -Current ($i + 1) -Total $FilesToDelete.Count -Label "Files" -StartTime $FileStartTime -CurrentItem $item.Name -CurrentOperation "Removing"
 }
-
-$allPaths = @()
-foreach ($categoryPaths in $ScanLocations.Values) {
-    foreach ($path in $categoryPaths) {
-        $allPaths += $path
-    }
-}
-
-$removedDirectories = Remove-EmptyDirectories -Paths $allPaths
-$script:CleanupSummary.EmptyFoldersRemoved = $removedDirectories
-Write-Host ""
-Write-Host ("Empty folders removed: {0}" -f $removedDirectories) -ForegroundColor Green
-Write-Host ""
 
 Write-Host "[4/6] CLEANING TEMPORARY FILES" -ForegroundColor Cyan
 Write-Host "Temporary cleanup is disabled for this run because it is not target-specific." -ForegroundColor Yellow
@@ -905,7 +909,6 @@ Write-Host ("Files deleted: {0}" -f $filesDeleted) -ForegroundColor White
 Write-Host ("Folders deleted: {0}" -f $foldersDeleted) -ForegroundColor White
 Write-Host ("Registry items deleted: {0}" -f $registryDeleted) -ForegroundColor White
 Write-Host ("Temporary files deleted: {0}" -f $CleanupSummary.TemporaryFilesDeleted) -ForegroundColor White
-Write-Host ("Empty folders removed: {0}" -f $CleanupSummary.EmptyFoldersRemoved) -ForegroundColor White
 Write-Host ("Startup entries removed: {0}" -f $CleanupSummary.StartupEntriesRemoved) -ForegroundColor White
 Write-Host ("Scheduled tasks removed: {0}" -f $CleanupSummary.ScheduledTasksRemoved) -ForegroundColor White
 Write-Host ("Services removed: {0}" -f $CleanupSummary.ServicesRemoved) -ForegroundColor White
