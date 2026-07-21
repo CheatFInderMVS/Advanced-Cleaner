@@ -196,7 +196,6 @@ function Show-LoadingBar {
     $filled = [math]::Min([math]::Max([int]($percent / 100 * $barLength), 0), $barLength)
     $bar = ('█' * $filled) + ('-' * ($barLength - $filled))
 
-    Write-Host ""
     Write-Host ($Label) -ForegroundColor Cyan
     Write-Host ("Progress: [{0}] {1}%" -f $bar, $percent) -ForegroundColor Green
     Write-Host ("Items: {0} / {1}" -f $Current, $Total) -ForegroundColor Yellow
@@ -424,6 +423,30 @@ function Remove-FirewallArtifacts {
     return $removed
 }
 
+function Remove-DefenderExclusions {
+    if (-not (Get-Command Get-MpPreference -ErrorAction SilentlyContinue)) {
+        return 0
+    }
+
+    $removed = 0
+
+    try {
+        $prefs = Get-MpPreference -ErrorAction Stop
+        foreach ($path in @($prefs.ExclusionPath)) {
+            if ([string]::IsNullOrWhiteSpace($path)) { continue }
+            if (Test-TargetReference -Text $path) {
+                Remove-MpPreference -ExclusionPath $path -ErrorAction SilentlyContinue
+                Add-DeletedItem -Kind "DEFENDER" -Name ([System.IO.Path]::GetFileName($path)) -Path $path -Timestamp (Get-Date)
+                $removed++
+            }
+        }
+    }
+    catch {
+    }
+
+    return $removed
+}
+
 function Remove-RegistryArtifactValues {
     param(
         [Parameter(Mandatory)]
@@ -494,6 +517,7 @@ function Remove-RegistryArtifactValues {
 
 # FILE SCANNER
 $FilesToDelete = [System.Collections.Generic.List[object]]::new()
+$seenFilePaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 Clear-Host
 Write-Host ""
@@ -536,7 +560,10 @@ foreach ($category in $ScanLocations.Keys) {
                 Where-Object { Test-MatchesTarget $_.Name }
 
             foreach ($item in $items) {
-                $FilesToDelete.Add($item)
+                $fullPath = $item.FullName
+                if ($seenFilePaths.Add($fullPath)) {
+                    $FilesToDelete.Add($item)
+                }
             }
         }
     }
@@ -606,7 +633,14 @@ for ($i = 0; $i -lt $FilesToDelete.Count; $i++) {
     Show-LoadingBar -Current ($i + 1) -Total $FilesToDelete.Count -Label "Files" -StartTime $FileStartTime -CurrentItem $item.Name -CurrentOperation "Removing"
 }
 
-$removedDirectories = Remove-EmptyDirectories -Paths @($ScanLocations.Values)
+$allPaths = @()
+foreach ($categoryPaths in $ScanLocations.Values) {
+    foreach ($path in $categoryPaths) {
+        $allPaths += $path
+    }
+}
+
+$removedDirectories = Remove-EmptyDirectories -Paths $allPaths
 $script:CleanupSummary.EmptyFoldersRemoved = $removedDirectories
 Write-Host ""
 Write-Host ("Empty folders removed: {0}" -f $removedDirectories) -ForegroundColor Green
@@ -705,8 +739,13 @@ if ($RegistryItems.Count -gt 0) {
     }
 
     if (Get-Command Checkpoint-Computer -ErrorAction SilentlyContinue) {
-        Write-Host "Creating system restore point..." -ForegroundColor Yellow
-        Checkpoint-Computer -Description "Before Cleanup" -RestorePointType MODIFY_SETTINGS | Out-Null
+        try {
+            Write-Host "Creating system restore point..." -ForegroundColor Yellow
+            Checkpoint-Computer -Description "Before Cleanup" -RestorePointType MODIFY_SETTINGS | Out-Null
+        }
+        catch {
+            Write-Host "System restore point creation was skipped or failed." -ForegroundColor Yellow
+        }
     }
 
     $RegistryStartTime = Get-Date
@@ -725,7 +764,12 @@ if ($RegistryItems.Count -gt 0) {
                 Remove-Item -LiteralPath $item.Path -Recurse -Force -ErrorAction Stop
             }
             else {
-                if (-not (Test-MatchesTarget $item.Name)) {
+                $valueMatches = Test-MatchesTarget $item.Name
+                if (-not $valueMatches -and $item.PSObject.Properties.Match('ValueData').Count -gt 0 -and $null -ne $item.ValueData) {
+                    $valueMatches = Test-TargetReference -Text ([string]$item.ValueData)
+                }
+
+                if (-not $valueMatches) {
                     throw "Registry value verification failed"
                 }
                 Remove-ItemProperty -Path $item.Path -Name $item.Name -ErrorAction Stop
@@ -758,7 +802,16 @@ foreach ($path in $startupPaths) {
         $props = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
         foreach ($propName in $props.PSObject.Properties.Name) {
             if ($propName -in @('PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider')) { continue }
-            if (Test-MatchesTarget $propName) {
+
+            $value = $props.$propName
+            $matchesName = Test-MatchesTarget $propName
+            $matchesValue = $false
+
+            if ($value -is [string]) {
+                $matchesValue = Test-TargetReference -Text $value
+            }
+
+            if ($matchesName -or $matchesValue) {
                 Remove-ItemProperty -Path $path -Name $propName -ErrorAction SilentlyContinue
                 $script:CleanupSummary.StartupEntriesRemoved++
             }
@@ -782,7 +835,16 @@ if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
 
 $services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue
 foreach ($service in $services) {
-    $binaryName = [System.IO.Path]::GetFileName($service.PathName)
+    $servicePath = [string]$service.PathName
+    $binaryName = $null
+
+    if ($servicePath -match '(?i)([a-z]:\\.+?\.exe)') {
+        $binaryName = Split-Path $Matches[1] -Leaf
+    }
+    else {
+        $binaryName = [System.IO.Path]::GetFileName($servicePath)
+    }
+
     if (Test-MatchesTarget $binaryName) {
         Stop-Service -Name $service.Name -ErrorAction SilentlyContinue
         Invoke-CimMethod -ClassName Win32_Service -MethodName Delete -Arguments @{ Name = $service.Name } -ErrorAction SilentlyContinue | Out-Null
@@ -802,14 +864,15 @@ Remove-ShortcutArtifacts -Paths @(
 ) | Out-Null
 
 Remove-FirewallArtifacts | Out-Null
+Remove-DefenderExclusions | Out-Null
 
-$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs" -InspectData
-$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU" -InspectData
-$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\MuiCache" -InspectName -InspectData
-$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store" -InspectData
-$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" -InspectData
-$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" -InspectData
-$script:CleanupSummary.RegistryArtifactsRemoved += Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist" -InspectName -InspectData -DecodeName
+Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs" -InspectData | Out-Null
+Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU" -InspectData | Out-Null
+Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\MuiCache" -InspectName -InspectData | Out-Null
+Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store" -InspectData | Out-Null
+Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" -InspectData | Out-Null
+Remove-RegistryArtifactValues -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" -InspectData | Out-Null
+Remove-RegistryArtifactValues -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist" -InspectName -InspectData -DecodeName | Out-Null
 
 # REPORTING
 $RecoveredMB = [math]::Round($RecoveredBytes / 1MB, 2)
