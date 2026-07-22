@@ -21,6 +21,10 @@ Write-Host "====================================" -ForegroundColor Cyan
 Write-Host "Press ENTER to continue..." -ForegroundColor Yellow
 Pause
 
+# Safety: default to dry-run. Set to $false to allow real deletions.
+$DryRun = $true
+Write-Host "DRY-RUN mode: no destructive actions will be performed. Set `$DryRun = $false` to enable deletions." -ForegroundColor Yellow
+
 $DeletedItems = [System.Collections.Generic.List[object]]::new()
 $FailedItems = [System.Collections.Generic.List[object]]::new()
 $RecoveredBytes = 0
@@ -286,10 +290,20 @@ function Remove-TargetFileOrFolder {
         }
 
         if ($Item.PSIsContainer) {
-            Remove-Item -LiteralPath $Item.FullName -Recurse -Force -ErrorAction Stop
+            if ($DryRun) {
+                Write-Host ("DRY-RUN: Would remove folder: {0}" -f $Item.FullName) -ForegroundColor Yellow
+            }
+            else {
+                Remove-Item -LiteralPath $Item.FullName -Recurse -Force -ErrorAction Stop
+            }
         }
         else {
-            Remove-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop
+            if ($DryRun) {
+                Write-Host ("DRY-RUN: Would remove file: {0}" -f $Item.FullName) -ForegroundColor Yellow
+            }
+            else {
+                Remove-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop
+            }
         }
 
         if (-not $Item.PSIsContainer -and $Item.PSObject.Properties.Match('Length').Count -gt 0) {
@@ -419,10 +433,17 @@ function Remove-ShortcutArtifacts {
             try {
                 $target = Get-ShortcutTarget -Path $shortcut.FullName
                 if (Test-TargetReference -Text $target) {
-                    Remove-Item -LiteralPath $shortcut.FullName -Force -ErrorAction Stop
-                    Add-DeletedItem -Kind "SHORTCUT" -Name $shortcut.Name -Path $shortcut.FullName -Timestamp $shortcut.LastWriteTime
-                    $script:CleanupSummary.ShortcutsRemoved++
-                    $removed++
+                    if ($DryRun) {
+                        Write-Host ("DRY-RUN: Would remove shortcut: {0}" -f $shortcut.FullName) -ForegroundColor Yellow
+                        Add-DeletedItem -Kind "SHORTCUT" -Name $shortcut.Name -Path $shortcut.FullName -Timestamp $shortcut.LastWriteTime -Reason "DRY-RUN"
+                        $removed++
+                    }
+                    else {
+                        Remove-Item -LiteralPath $shortcut.FullName -Force -ErrorAction Stop
+                        Add-DeletedItem -Kind "SHORTCUT" -Name $shortcut.Name -Path $shortcut.FullName -Timestamp $shortcut.LastWriteTime
+                        $script:CleanupSummary.ShortcutsRemoved++
+                        $removed++
+                    }
                 }
             }
             catch {
@@ -446,11 +467,19 @@ function Remove-FirewallArtifacts {
             $filters = @(Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue)
             foreach ($filter in $filters) {
                 if (Test-TargetReference -Text $filter.Program) {
-                    Remove-NetFirewallRule -Name $rule.Name -ErrorAction Stop
-                    Add-DeletedItem -Kind "FIREWALL" -Name $rule.DisplayName -Path $rule.Name -Timestamp (Get-Date)
-                    $script:CleanupSummary.FirewallRulesRemoved++
-                    $removed++
-                    break
+                    if ($DryRun) {
+                        Write-Host ("DRY-RUN: Would remove firewall rule: {0} ({1})" -f $rule.Name, $rule.DisplayName) -ForegroundColor Yellow
+                        Add-DeletedItem -Kind "FIREWALL" -Name $rule.DisplayName -Path $rule.Name -Timestamp (Get-Date) -Reason "DRY-RUN"
+                        $removed++
+                        break
+                    }
+                    else {
+                        Remove-NetFirewallRule -Name $rule.Name -ErrorAction Stop
+                        Add-DeletedItem -Kind "FIREWALL" -Name $rule.DisplayName -Path $rule.Name -Timestamp (Get-Date)
+                        $script:CleanupSummary.FirewallRulesRemoved++
+                        $removed++
+                        break
+                    }
                 }
             }
         }
@@ -473,11 +502,18 @@ function Remove-DefenderExclusions {
         $prefs = Get-MpPreference -ErrorAction Stop
         foreach ($path in @($prefs.ExclusionPath)) {
             if ([string]::IsNullOrWhiteSpace($path)) { continue }
-            if (Test-TargetReference -Text $path) {
-                Remove-MpPreference -ExclusionPath $path -ErrorAction SilentlyContinue
-                Add-DeletedItem -Kind "DEFENDER" -Name ([System.IO.Path]::GetFileName($path)) -Path $path -Timestamp (Get-Date)
-                $removed++
-            }
+                if (Test-TargetReference -Text $path) {
+                    if ($DryRun) {
+                        Write-Host ("DRY-RUN: Would remove Defender exclusion: {0}" -f $path) -ForegroundColor Yellow
+                        Add-DeletedItem -Kind "DEFENDER" -Name ([System.IO.Path]::GetFileName($path)) -Path $path -Timestamp (Get-Date) -Reason "DRY-RUN"
+                        $removed++
+                    }
+                    else {
+                        Remove-MpPreference -ExclusionPath $path -ErrorAction SilentlyContinue
+                        Add-DeletedItem -Kind "DEFENDER" -Name ([System.IO.Path]::GetFileName($path)) -Path $path -Timestamp (Get-Date)
+                        $removed++
+                    }
+                }
         }
     }
     catch {
@@ -533,9 +569,18 @@ function Remove-RegistryArtifactValues {
 
             if ($match) {
                 try {
-                    Remove-ItemProperty -Path $key.PSPath -Name $valueName -ErrorAction Stop
-                    Add-DeletedItem -Kind "REGISTRY" -Name $valueName -Path $key.PSPath -Timestamp ([datetime]::MinValue)
-                    $script:CleanupSummary.RegistryArtifactsRemoved++
+                    if ($DryRun) {
+                        Write-Host ("DRY-RUN: Would remove registry value: {0} at {1}" -f $valueName, $key.PSPath) -ForegroundColor Yellow
+                        Add-DeletedItem -Kind "REGISTRY" -Name $valueName -Path $key.PSPath -Timestamp ([datetime]::MinValue) -Reason "DRY-RUN"
+                        $script:CleanupSummary.RegistryArtifactsRemoved += 0
+                        $removed++
+                    }
+                    else {
+                        Remove-ItemProperty -Path $key.PSPath -Name $valueName -ErrorAction Stop
+                        Add-DeletedItem -Kind "REGISTRY" -Name $valueName -Path $key.PSPath -Timestamp ([datetime]::MinValue)
+                        $script:CleanupSummary.RegistryArtifactsRemoved++
+                        $removed++
+                    }
                     if ($Path -match 'RecentDocs|RunMRU') {
                         $script:CleanupSummary.RecentItemsRemoved++
                     }
@@ -663,11 +708,16 @@ for ($i = 0; $i -lt $FilesToDelete.Count; $i++) {
     if (Test-Path -LiteralPath $item.FullName) {
         $result = Remove-TargetFileOrFolder -Item $item
         if ($result.Success) {
-            if ($item.PSIsContainer) {
-                $script:CleanupSummary.FoldersDeleted++
+            if (-not $DryRun) {
+                if ($item.PSIsContainer) {
+                    $script:CleanupSummary.FoldersDeleted++
+                }
+                else {
+                    $script:CleanupSummary.FilesDeleted++
+                }
             }
             else {
-                $script:CleanupSummary.FilesDeleted++
+                Write-Host ("DRY-RUN: would have counted deletion for {0}" -f $item.FullName) -ForegroundColor DarkYellow
             }
         }
     }
@@ -762,12 +812,18 @@ if ($RegistryItems.Count -gt 0) {
     for ($i = 0; $i -lt $RegistryItems.Count; $i++) {
         $item = $RegistryItems[$i]
         try {
-            if ($item.Type -eq "KEY") {
+                if ($item.Type -eq "KEY") {
                 $confirmName = Split-Path $item.Path -Leaf
                 if (-not (Test-MatchesTarget $confirmName)) {
                     throw "Registry key name verification failed"
                 }
-                Remove-Item -LiteralPath $item.Path -Recurse -Force -ErrorAction Stop
+                    if ($DryRun) {
+                        Write-Host ("DRY-RUN: Would remove registry key: {0}" -f $item.Path) -ForegroundColor Yellow
+                        Add-DeletedItem -Kind "REGISTRY" -Name $item.Name -Path $item.Path -Timestamp ([datetime]::MinValue) -Reason "DRY-RUN"
+                    }
+                    else {
+                        Remove-Item -LiteralPath $item.Path -Recurse -Force -ErrorAction Stop
+                    }
             }
             else {
                 $valueMatches = Test-MatchesTarget $item.Name
@@ -778,7 +834,13 @@ if ($RegistryItems.Count -gt 0) {
                 if (-not $valueMatches) {
                     throw "Registry value verification failed"
                 }
-                Remove-ItemProperty -Path $item.Path -Name $item.Name -ErrorAction Stop
+                if ($DryRun) {
+                    Write-Host ("DRY-RUN: Would remove registry value {0} at {1}" -f $item.Name, $item.Path) -ForegroundColor Yellow
+                    Add-DeletedItem -Kind "REGISTRY" -Name $item.Name -Path $item.Path -Timestamp ([datetime]::MinValue) -Reason "DRY-RUN"
+                }
+                else {
+                    Remove-ItemProperty -Path $item.Path -Name $item.Name -ErrorAction Stop
+                }
             }
 
             Add-DeletedItem -Kind "REGISTRY" -Name $item.Name -Path $item.Path -Timestamp ([datetime]::MinValue)
@@ -818,8 +880,14 @@ foreach ($path in $startupPaths) {
             }
 
             if ($matchesName -or $matchesValue) {
-                Remove-ItemProperty -Path $path -Name $propName -ErrorAction SilentlyContinue
-                $script:CleanupSummary.StartupEntriesRemoved++
+                if ($DryRun) {
+                    Write-Host ("DRY-RUN: Would remove startup entry {0} at {1}" -f $propName, $path) -ForegroundColor Yellow
+                    Add-DeletedItem -Kind "STARTUP" -Name $propName -Path $path -Timestamp (Get-Date) -Reason "DRY-RUN"
+                }
+                else {
+                    Remove-ItemProperty -Path $path -Name $propName -ErrorAction SilentlyContinue
+                    $script:CleanupSummary.StartupEntriesRemoved++
+                }
             }
         }
     }
@@ -831,9 +899,16 @@ if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
         foreach ($action in @($task.Actions)) {
             $leaf = [System.IO.Path]::GetFileName($action.Execute)
             if (Test-MatchesTarget $leaf) {
-                Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
-                $script:CleanupSummary.ScheduledTasksRemoved++
-                break
+                if ($DryRun) {
+                    Write-Host ("DRY-RUN: Would unregister scheduled task: {0}" -f $task.TaskName) -ForegroundColor Yellow
+                    Add-DeletedItem -Kind "TASK" -Name $task.TaskName -Path $task.TaskPath -Timestamp (Get-Date) -Reason "DRY-RUN"
+                    break
+                }
+                else {
+                    Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                    $script:CleanupSummary.ScheduledTasksRemoved++
+                    break
+                }
             }
         }
     }
@@ -852,9 +927,15 @@ foreach ($service in $services) {
     }
 
     if (Test-MatchesTarget $binaryName) {
-        Stop-Service -Name $service.Name -ErrorAction SilentlyContinue
-        Invoke-CimMethod -ClassName Win32_Service -MethodName Delete -Arguments @{ Name = $service.Name } -ErrorAction SilentlyContinue | Out-Null
-        $script:CleanupSummary.ServicesRemoved++
+        if ($DryRun) {
+            Write-Host ("DRY-RUN: Would stop and remove service: {0} (binary {1})" -f $service.Name, $binaryName) -ForegroundColor Yellow
+            Add-DeletedItem -Kind "SERVICE" -Name $service.Name -Path $servicePath -Timestamp (Get-Date) -Reason "DRY-RUN"
+        }
+        else {
+            Stop-Service -Name $service.Name -ErrorAction SilentlyContinue
+            Invoke-CimMethod -ClassName Win32_Service -MethodName Delete -Arguments @{ Name = $service.Name } -ErrorAction SilentlyContinue | Out-Null
+            $script:CleanupSummary.ServicesRemoved++
+        }
     }
 }
 
